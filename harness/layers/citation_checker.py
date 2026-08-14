@@ -62,22 +62,59 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _line_match(text: str, body: str) -> bool:
+    """Kiểm tra `text` có khớp nguyên văn ÍT NHẤT MỘT DÒNG của `body` không.
+
+    Đây là tiêu chuẩn khớp của scorer: claim phải là substring của một dòng
+    đơn — không phải substring của cả khối body (có thể vắt qua nhiều dòng).
+    """
+    if not text or not body:
+        return False
+    return any(text in line for line in body.splitlines())
+
+
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        # Xây cache: danh sách tài liệu mà agent ĐÃ quan sát nguyên vẹn
+        # (toàn bộ body nằm trong ctx.observed_text)
+        observed_docs = [
+            doc for doc in ctx.corpus.docs
+            if doc.body and doc.body in ctx.observed_text
+        ]
+
+        for claim in claims:
+            text = claim.get("text", "")
+            if not text:
+                continue
+
+            # Bước 2: kiểm tra doc_id hiện tại có đúng không
+            current_doc = ctx.corpus.get(claim.get("doc_id", ""))
+            if current_doc and _line_match(text, current_doc.body):
+                # Trích dẫn đúng rồi, không cần làm gì
+                continue
+
+            # Bước 3: tìm tài liệu đúng trong danh sách đã quan sát
+            correct_doc = None
+            for doc in observed_docs:
+                if _line_match(text, doc.body):
+                    correct_doc = doc
+                    break
+
+            if correct_doc:
+                # Chỉ đổi doc_id, KHÔNG đụng vào claim["text"]
+                claim["doc_id"] = correct_doc.doc_id
+            # Bước 4: không tìm được -> để critic xử lý, không làm gì
+
+        # Bước 5: đồng bộ citations theo doc_id thực tế
+        report["citations"] = list(dict.fromkeys(
+            c["doc_id"] for c in claims if c.get("doc_id")
+        ))
+        return report

@@ -73,22 +73,75 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _find_doc(ctx, text: str) -> str | None:
+    """Tìm doc_id của tài liệu đầu tiên có chứa `text` nguyên văn."""
+    for doc in ctx.corpus.docs:
+        if text in doc.body or text in doc.title:
+            return doc.doc_id
+    return None
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept = []
+        has_split = False
+
+        for claim in claims:
+            text = claim.get("text", "")
+
+            # Bước 2: claim có trong quan sát -> giữ nguyên
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+
+            # Bước 3: thử tách câu ghép (trường hợp mâu thuẫn — mô hình nối
+            # nửa câu của hai tài liệu khác nhau bằng " và ")
+            split_parts = None
+            for sep in (" và ", " nhưng ", " song ", ", trong khi "):
+                idx = text.find(sep)
+                if idx == -1:
+                    continue
+                left = text[:idx].strip()
+                right = text[idx + len(sep):].strip()
+                if ctx.saw(left) and ctx.saw(right) and left and right:
+                    # Tìm doc_id cho từng nửa
+                    left_doc = _find_doc(ctx, left)
+                    right_doc = _find_doc(ctx, right)
+                    if left_doc and right_doc and left_doc != right_doc:
+                        split_parts = [
+                            {"text": left,  "doc_id": left_doc},
+                            {"text": right, "doc_id": right_doc},
+                        ]
+                        break
+
+            if split_parts:
+                kept.extend(split_parts)
+                has_split = True
+            # Bước 4: bịa hoàn toàn -> bỏ đi
+
+        # Bước 5: không còn claim hợp lệ
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời câu hỏi này."
+            return report
+
+        # Câu ghép được tách -> bộc lộ mâu thuẫn, nên abstain
+        if has_split:
+            report["abstain"] = True
+
+        report["claims"] = kept
+        # Bước 6: đồng bộ citations theo doc_id thực tế của claims còn lại
+        report["citations"] = list(dict.fromkeys(
+            c["doc_id"] for c in kept if c.get("doc_id")
+        ))
+        return report

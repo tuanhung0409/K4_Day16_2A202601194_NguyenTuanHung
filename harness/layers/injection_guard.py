@@ -47,12 +47,34 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import re
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+
+def _strip_injection(content: str) -> str:
+    """Xoá tất cả các đoạn độc hại (có thể bị cắt giữa chừng nên không cần BLOCK_END)."""
+    while BLOCK_START in content:
+        start_idx = content.find(BLOCK_START)
+        end_idx = content.find(BLOCK_END, start_idx)
+        if end_idx != -1:
+            # Tìm thấy cả hai dấu mốc → cắt đến hết BLOCK_END
+            content = (
+                content[:start_idx]
+                + PLACEHOLDER
+                + content[end_idx + len(BLOCK_END):]
+            )
+        else:
+            # Chỉ có dấu mốc MỞ (fetch bị cắt giữa chừng) → cắt tới hết
+            content = content[:start_idx] + PLACEHOLDER
+    return content
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +84,19 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        # Bước 1: không có đoạn độc → trả về nguyên
+        if BLOCK_START not in result.content:
+            return result
+        # Bước 2-3: lặp cắt cho tới khi sạch hoàn toàn
+        clean_content = _strip_injection(result.content)
+        # Bước 4: trả về ToolResult mới giữ nguyên ok/error
+        return ToolResult(ok=result.ok, content=clean_content, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Quét lần cuối: gỡ canary ra khỏi answer nếu còn sót
+        # KHÔNG đụng vào claim["text"] — chỉ sửa answer
+        answer = report.get("answer", "")
+        if INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+        return report
+
